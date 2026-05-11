@@ -27,7 +27,13 @@ class WhatsAppWebhookService
                 foreach (Arr::get($value, 'messages', []) as $incoming) {
                     $phone = (string) Arr::get($incoming, 'from');
                     $type = (string) Arr::get($incoming, 'type', 'text');
+                    $externalId = (string) Arr::get($incoming, 'id', '');
                     $contact = $contactsByWaId->get($phone, []);
+
+                    // Deduplicate: Meta retries webhooks — skip if we already stored this message
+                    if ($externalId !== '' && Message::query()->where('external_id', $externalId)->exists()) {
+                        continue;
+                    }
 
                     $body = Arr::get($incoming, 'text.body')
                         ?? Arr::get($incoming, 'interactive.button_reply.id')
@@ -56,7 +62,7 @@ class WhatsAppWebhookService
                         'direction' => 'in',
                         'channel' => 'whatsapp',
                         'message_type' => $type,
-                        'external_id' => Arr::get($incoming, 'id'),
+                        'external_id' => $externalId ?: null,
                         'phone' => $phone,
                         'body' => $body,
                         'media_url' => $mediaUrl,

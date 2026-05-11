@@ -473,6 +473,18 @@ PROMPT;
             }
         }
 
+        // "What's next", "now what", "then what" etc. → treat as next-step question
+        $nextStepPatterns = ["what's next", 'whats next', 'what next', 'now what',
+                             'then what', 'aage kya', 'ab kya', 'next step', 'what should i do',
+                             'what do i do', 'how to order', 'how do i order', 'phir kya'];
+        foreach ($nextStepPatterns as $pattern) {
+            if (str_contains($n, $pattern)) {
+                return ['action' => 'none', 'items' => [], 'reply_text' => $isUrdu
+                    ? 'Ab CONFIRM likhein order place karne ke liye, ya aur items add karein. 😊'
+                    : 'You can type CONFIRM to place your order, or add more items. 😊'];
+            }
+        }
+
         // If text has NO digits and is very short (1-2 words) with no product-like content → help
         // This catches things like "order", "buy", "shopping" alone
         $wordCount = str_word_count($n);
@@ -485,7 +497,7 @@ PROMPT;
                     break;
                 }
             }
-            // Very short generic words that are not product names → let LLM handle or show help
+            // Very short generic words that are not product names → show catalog
             $genericSingleWords = ['order', 'buy', 'shop', 'shopping', 'purchase', 'delivery', 'deliver'];
             if (! $looksLikeProduct && in_array($n, $genericSingleWords, true)) {
                 return ['action' => 'show_catalog', 'items' => [], 'reply_text' => $isUrdu
