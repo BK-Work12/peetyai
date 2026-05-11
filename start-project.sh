@@ -8,6 +8,21 @@ log() {
   echo "[PeetyAI] $*"
 }
 
+usage() {
+  cat <<'EOF'
+Usage: bash start-project.sh [--ssl] [--domain example.com] [--email admin@example.com]
+
+Options:
+  --ssl             Issue or renew a Let's Encrypt certificate and enable HTTPS.
+  --domain DOMAIN   Domain name to secure, for example peety.ai.
+  --email EMAIL     Email address used by Let's Encrypt for expiry notices.
+EOF
+}
+
+SSL_ENABLED=false
+SSL_DOMAIN=""
+SSL_EMAIL=""
+
 need_sudo() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "sudo"
@@ -59,6 +74,103 @@ EOF
   fi
 }
 
+write_http_nginx_config() {
+  cat > deploy/nginx/default.conf <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    resolver 127.0.0.11 valid=30s;
+    resolver_timeout 5s;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+        allow all;
+    }
+
+    location /api/ {
+        set $backend_upstream backend:8000;
+        proxy_pass http://$backend_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        set $frontend_upstream frontend:3000;
+        proxy_pass http://$frontend_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+EOF
+}
+
+write_ssl_nginx_config() {
+  if [[ -z "$SSL_DOMAIN" ]]; then
+    echo "SSL domain is required before writing the HTTPS config." >&2
+    exit 1
+  fi
+
+  sed "s/__DOMAIN__/${SSL_DOMAIN}/g" deploy/nginx/default-ssl.conf > deploy/nginx/default.conf
+}
+
+start_http_only_stack() {
+  log "Starting Nginx for certificate validation..."
+  docker compose up -d --no-deps nginx
+}
+
+issue_ssl_certificate() {
+  if [[ -z "$SSL_DOMAIN" || -z "$SSL_EMAIL" ]]; then
+    echo "--domain and --email are required when --ssl is enabled." >&2
+    exit 1
+  fi
+
+  log "Requesting Let's Encrypt certificate for ${SSL_DOMAIN}..."
+  docker compose run --rm certbot certonly \
+    --webroot \
+    --webroot-path /var/www/certbot \
+    --email "$SSL_EMAIL" \
+    --agree-tos \
+    --no-eff-email \
+    --keep-until-expiring \
+    --non-interactive \
+    -d "$SSL_DOMAIN"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssl)
+        SSL_ENABLED=true
+        shift
+        ;;
+      --domain)
+        SSL_DOMAIN="${2:-}"
+        shift 2
+        ;;
+      --email)
+        SSL_EMAIL="${2:-}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
 start_stack() {
   log "Building and starting containers..."
   docker compose up -d --build
@@ -69,6 +181,7 @@ start_stack() {
   fi
 
   docker compose exec -T backend php artisan migrate --force
+  docker compose exec -T backend php artisan db:seed --force
   docker compose exec -T backend php artisan config:cache
   docker compose exec -T backend php artisan route:cache
   docker compose exec -T backend php artisan view:cache
@@ -80,8 +193,17 @@ start_stack() {
 }
 
 main() {
+  parse_args "$@"
   install_docker_if_missing
   ensure_env_files
+  write_http_nginx_config
+
+  if [[ "$SSL_ENABLED" == true ]]; then
+    start_http_only_stack
+    issue_ssl_certificate
+    write_ssl_nginx_config
+  fi
+
   start_stack
 
   cat <<'EOF'
@@ -91,6 +213,14 @@ IMPORTANT:
 - Re-run this script after changing backend/.env:
     bash start-project.sh
 EOF
+
+  if [[ "$SSL_ENABLED" == true ]]; then
+    cat <<EOF
+
+HTTPS enabled for ${SSL_DOMAIN}
+Open: https://${SSL_DOMAIN}
+EOF
+  fi
 }
 
 main "$@"

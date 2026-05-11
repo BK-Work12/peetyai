@@ -13,7 +13,7 @@ class DatabaseSeeder extends Seeder
     public function run(): void
     {
         // Platform owner
-        User::firstOrCreate(['email' => 'owner@peetyai.com'], [
+        User::updateOrCreate(['email' => 'owner@peetyai.com'], [
             'name'        => 'Platform Owner',
             'role'        => UserRole::Owner,
             'password'    => Hash::make('password'),
@@ -49,14 +49,14 @@ class DatabaseSeeder extends Seeder
             ],
         ]);
 
-        User::firstOrCreate(['email' => 'admin@freshmart.ae'], [
+        User::updateOrCreate(['email' => 'admin@freshmart.ae'], [
             'retailer_id' => $freshMart->id,
             'name'        => 'Fresh Mart Admin',
             'role'        => UserRole::Retailer,
             'password'    => Hash::make('password'),
         ]);
 
-        User::firstOrCreate(['email' => 'staff@freshmart.ae'], [
+        User::updateOrCreate(['email' => 'staff@freshmart.ae'], [
             'retailer_id' => $freshMart->id,
             'name'        => 'Fresh Mart Staff',
             'role'        => UserRole::Staff,
@@ -75,7 +75,7 @@ class DatabaseSeeder extends Seeder
             'settings'           => [],
         ]);
 
-        User::firstOrCreate(['email' => 'admin@dailybasket.ae'], [
+        User::updateOrCreate(['email' => 'admin@dailybasket.ae'], [
             'retailer_id' => $daily->id,
             'name'        => 'Daily Basket Admin',
             'role'        => UserRole::Retailer,
