@@ -89,18 +89,27 @@ class ProcessIncomingMessage implements ShouldQueue
             }
         }
 
-        if (mb_strtolower(trim((string) $message->body)) === 'confirm') {
+        // Also catch typed "confirm" as confirm_order shortcut
+        if (in_array(mb_strtolower(trim((string) $message->body)), ['confirm', 'تأكيد', 'تأكيد الطلب'], true)) {
             $this->handleConfirmIntent($message, $cartService, $orderService, $whatsAppClient);
-
             $message->forceFill(['processed' => true])->save();
 
             return;
         }
 
-        $result = $aiOrderService->parseMessage($message, $message->customer, $customerContext);
-        $aiReply = $this->extractAiReply($result);
+        $result   = $aiOrderService->parseMessage($message, $message->customer, $customerContext);
+        $aiReply  = $this->extractAiReply($result);
+        $action   = $result['action'] ?? 'help';
 
-        if (($result['action'] ?? null) === 'track_order') {
+        if ($action === 'confirm_order') {
+            // AI decided the customer wants to confirm — run the order flow directly
+            $this->handleConfirmIntent($message, $cartService, $orderService, $whatsAppClient, $aiReply);
+            $message->forceFill(['processed' => true])->save();
+
+            return;
+        }
+
+        if ($action === 'track_order') {
             $trackingText = $this->buildOrderTrackingMessage($message);
             $this->safeSendText($whatsAppClient, $message, $this->mergeReply($aiReply, $trackingText));
             $message->forceFill(['processed' => true])->save();
@@ -108,21 +117,21 @@ class ProcessIncomingMessage implements ShouldQueue
             return;
         }
 
-        if (($result['action'] ?? null) === 'show_catalog') {
+        if ($action === 'show_catalog') {
             $this->sendCatalogWithButtons($message, $whatsAppClient, $aiReply);
             $message->forceFill(['processed' => true])->save();
 
             return;
         }
 
-        if (($result['action'] ?? null) === 'help' || ($result['action'] ?? null) === 'none') {
+        if ($action === 'help' || $action === 'none') {
             $this->safeSendButtons(
                 $whatsAppClient,
                 $message,
                 $aiReply ?: $this->buildHelpMessage($message),
                 [
                     ['id' => 'BTN_CATALOG', 'title' => 'Show Items'],
-                    ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                    ['id' => 'BTN_TRACK',   'title' => 'Track Order'],
                     ['id' => 'BTN_CONFIRM', 'title' => 'Confirm Order'],
                 ]
             );
@@ -131,7 +140,7 @@ class ProcessIncomingMessage implements ShouldQueue
             return;
         }
 
-        if (($result['action'] ?? null) === 'request_option') {
+        if ($action === 'request_option') {
             $optionText = (string) ($result['message'] ?? 'Please choose one option.');
             $this->safeSendText($whatsAppClient, $message, $this->mergeReply($aiReply, $optionText));
             $message->forceFill(['processed' => true])->save();
@@ -139,7 +148,7 @@ class ProcessIncomingMessage implements ShouldQueue
             return;
         }
 
-        if (($result['action'] ?? null) === 'add_to_cart') {
+        if ($action === 'add_to_cart') {
             $items = $result['items'] ?? [];
             if (! is_array($items)) {
                 $items = [];
@@ -318,20 +327,17 @@ class ProcessIncomingMessage implements ShouldQueue
         Message $message,
         CartService $cartService,
         OrderService $orderService,
-        WhatsAppClient $whatsAppClient
+        WhatsAppClient $whatsAppClient,
+        ?string $aiReply = null
     ): void {
         $cart = $cartService->getOrCreate($message->retailer_id, $message->phone, $message->customer);
         $cart->load('items.product');
 
         if ($cart->items->isEmpty()) {
-            $this->safeSendButtons(
-                $whatsAppClient,
+            $this->sendCatalogWithButtons(
                 $message,
-                'Your cart is empty. Pick an item first.',
-                [
-                    ['id' => 'BTN_CATALOG', 'title' => 'Show Items'],
-                    ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
-                ]
+                $whatsAppClient,
+                $aiReply ?: 'Your cart is empty. Here is what we have — pick something to order!'
             );
 
             return;
@@ -351,12 +357,23 @@ class ProcessIncomingMessage implements ShouldQueue
             true
         );
 
+        // Build a rich order confirmation message
+        $totals    = $cartService->totals($cart);
+        $itemLines = $cart->items->map(fn ($item) =>
+            "{$item->quantity}x " . ($item->product?->name ?? 'item') . " — {$item->price}"
+        )->implode("\n");
+
+        $confirmText = "Your order #{$order->id} is confirmed!\n"
+            . "{$itemLines}\n"
+            . "Total: {$totals['subtotal']}\n"
+            . "We will notify you when it is out for delivery.";
+
         $this->safeSendButtons(
             $whatsAppClient,
             $message,
-            "Thanks. Order #{$order->id} placed successfully.",
+            $confirmText,
             [
-                ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                ['id' => 'BTN_TRACK',   'title' => 'Track Order'],
                 ['id' => 'BTN_CATALOG', 'title' => 'New Order'],
             ]
         );
