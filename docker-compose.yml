@@ -24,6 +24,7 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
+    restart: unless-stopped
     depends_on:
       - mysql
       - redis
@@ -34,7 +35,8 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
-    command: ["php", "artisan", "queue:work", "--queue=default", "--sleep=1", "--tries=3", "--timeout=120"]
+    restart: unless-stopped
+    command: ["php", "artisan", "queue:work", "--queue=default,memory-layer", "--sleep=3", "--tries=3", "--timeout=120", "--max-time=3600"]
     depends_on:
       - mysql
       - redis
