@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+:root {
+  /* WhatsApp-green dark theme (only dark mode supported) */
+  --background: #071a0e;
+  --foreground: #e8f5e9;
+  --accent: #25d366;
+  --accent-foreground: #071a0e;
+  --accent-teal: #128c7e;
+  --accent-teal-bright: #00a693;
+
+  --card-bg: rgba(13, 42, 22, 0.80);
+  --card-border: rgba(37, 211, 102, 0.14);
+  --card-shadow: 0 8px 32px -12px rgba(0, 0, 0, 0.60);
+  --sidebar-bg: rgba(5, 18, 10, 0.96);
+  --sidebar-border: rgba(37, 211, 102, 0.12);
+  --header-bg: #075e54;
+  --header-border: rgba(0, 0, 0, 0.20);
+  --text-primary: #e8f5e9;
+  --text-muted: rgba(232, 245, 233, 0.52);
+  --text-medium: rgba(232, 245, 233, 0.78);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-plex-mono);
+}
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 25%, rgba(18, 140, 126, 0.22), transparent 35%),
+    radial-gradient(circle at 85% 5%,  rgba(37, 211, 102, 0.14), transparent 30%),
+    linear-gradient(160deg, #050f09 0%, #071a0e 40%, #061508 100%);
+  color: var(--text-primary);
+  font-family: var(--font-space-grotesk), sans-serif;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+main {
+  animation: rise 0.45s ease-out;
+}
