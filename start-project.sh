@@ -171,9 +171,31 @@ parse_args() {
   done
 }
 
+wait_for_service_running() {
+  local service="$1"
+  local timeout_seconds="${2:-30}"
+  local elapsed=0
+
+  while (( elapsed < timeout_seconds )); do
+    if docker compose ps --status running --services | grep -qx "$service"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  log "Service '$service' is not running after ${timeout_seconds}s."
+  docker compose ps || true
+  log "Recent logs for '$service':"
+  docker compose logs --tail 200 "$service" || true
+  return 1
+}
+
 start_stack() {
   log "Building and starting containers..."
   docker compose up -d --build
+
+  wait_for_service_running backend 45
 
   log "Running Laravel setup..."
   if grep -Eq '^APP_KEY=$' backend/.env || ! grep -Eq '^APP_KEY=base64:' backend/.env; then

@@ -23,8 +23,6 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
-    volumes:
-      - ./backend:/var/www/html
     depends_on:
       - mysql
       - redis
@@ -36,8 +34,6 @@ services:
     env_file:
       - ./backend/.env
     command: ["php", "artisan", "queue:work", "--queue=default", "--sleep=1", "--tries=3", "--timeout=120"]
-    volumes:
-      - ./backend:/var/www/html
     depends_on:
       - mysql
       - redis
