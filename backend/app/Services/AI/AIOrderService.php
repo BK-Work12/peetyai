@@ -6,6 +6,7 @@ use App\Models\AiLog;
 use App\Models\Customer;
 use App\Models\Message;
 use App\Models\Product;
+use App\Services\CartService;
 use App\Services\ProductMatchingService;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
@@ -14,8 +15,10 @@ use Illuminate\Support\Facades\Log;
 
 class AIOrderService
 {
-    public function __construct(private readonly ProductMatchingService $matchingService)
-    {
+    public function __construct(
+        private readonly ProductMatchingService $matchingService,
+        private readonly CartService $cartService,
+    ) {
     }
 
     public function parseMessage(Message $message, ?Customer $customer, ?array $customerContext = null): array
@@ -149,55 +152,46 @@ class AIOrderService
     {
         $start = microtime(true);
         $preferredLanguage = $this->detectLanguagePreference($text, $message);
-
         $retailerName = (string) ($message->retailer?->name ?: 'the store');
         $customerName = trim((string) ($message->customer?->name ?: ''));
-        $conversationStep = $this->inferConversationStep($text);
-        $history = $this->conversationHistory($message);
         $catalogSnippet = $this->catalogSnippet($message->retailer_id);
 
-        $defaultSystem = "You are a friendly WhatsApp shopping assistant for {$retailerName}. "
-            ."Help customers browse products, place orders, and track orders in a warm, human way. "
-            ."\n\n"
-            ."Language rules: Auto-detect customer language from first message and mirror it (English, Urdu, Roman Urdu, or mixed). "
-            ."Do not switch language unless customer switches first. "
-            ."If language is unclear, always default to English. "
-            ."\n\n"
-            ."Tone rules: friendly, calm, concise, natural. Avoid robotic or corporate phrases. "
-            ."Keep replies short for WhatsApp and guide step-by-step. "
-            ."\n\n"
-            ."Business rules: never invent prices/availability, never ask for payment details, treat orders as COD/separate payment flow. "
-            ."For complex complaints/refund disputes, route to support using action=help. "
-            ."\n\n"
-            ."If asked whether you are AI, reply that you are a smart assistant helping {$retailerName}. "
-            ."\n\n"
-            ."CRITICAL OUTPUT FORMAT: Return strict JSON object only, with keys action, items, and reply_text. "
-            ."Allowed actions: add_to_cart, request_option, track_order, show_catalog, help, none. "
-            ."For add_to_cart, items must be an array of objects with product (string) and qty (integer >= 1). "
-            ."reply_text must be a short natural WhatsApp message (ideally 1-4 short lines, plain text, no markdown). "
-            ."Use track_order for status questions, show_catalog for browse/menu/new-order intent, help for greetings/ambiguous/support.";
-
-        $customSystem = trim((string) data_get($message->retailer?->settings, 'ai.system_prompt', ''));
-        $system = $customSystem !== '' ? $customSystem : $defaultSystem;
-
-        if (! empty($customerContext['summary'])) {
-            $system .= "\n\nCustomer context:\n".(string) $customerContext['summary'];
+        // Build cart state for context
+        $cartLines = 'Cart is empty.';
+        if ($message->retailer_id) {
+            try {
+                $cart = $this->cartService->getOrCreate($message->retailer_id, $message->phone, $message->customer);
+                $cart->load('items.product');
+                if ($cart->items->isNotEmpty()) {
+                    $totals = $this->cartService->totals($cart);
+                    $cartLines = $cart->items->map(
+                        fn ($item) => '- '.$item->quantity.' x '.($item->product?->name ?? 'item').' @ '.$item->price
+                    )->implode("\n");
+                    $cartLines .= "\nSubtotal: {$totals['subtotal']}";
+                }
+            } catch (\Throwable) {
+                // non-fatal — proceed without cart state
+            }
         }
 
-        $prompt = "retailer_name: {$retailerName}\n"
-            ."customer_name: ".($customerName !== '' ? $customerName : 'unknown')."\n"
-            ."preferred_language: {$preferredLanguage}\n"
-            ."conversation_step: {$conversationStep}\n"
-            ."catalog_snippet:\n{$catalogSnippet}\n"
-            ."conversation_history:\n{$history}\n"
-            ."customer_message: {$text}";
+        $customSystem = trim((string) data_get($message->retailer?->settings, 'ai.system_prompt', ''));
+        $system = $customSystem !== ''
+            ? $customSystem
+            : $this->buildSystemPrompt($retailerName, $catalogSnippet, $cartLines, $customerContext, $preferredLanguage, $customerName);
+
+        // Pass conversation history as real OpenAI messages for better context
+        $historyMessages = $this->conversationHistoryMessages($message);
+        $currentUserContent = $text;
+
+        // Compact log string for storage
+        $promptLog = "[system prompt]\n{$system}\n\n[history: ".count($historyMessages)." messages]\n[user]: {$text}";
 
         Log::info('AI prompt assembled', [
             'message_id' => $message->id,
             'retailer_id' => $message->retailer_id,
             'customer_id' => $message->customer_id,
-            'system_prompt' => $system,
-            'user_prompt' => $prompt,
+            'history_count' => count($historyMessages),
+            'user_message' => $text,
         ]);
 
         $provider = config('services.ai.provider', 'openai');
@@ -207,16 +201,18 @@ class AIOrderService
             $result = $this->fallbackIntent($text);
 
             if ($provider === 'openai' && config('services.ai.api_key')) {
+                $inputMessages = [
+                    ['role' => 'system', 'content' => $system],
+                    ...$historyMessages,
+                    ['role' => 'user', 'content' => $currentUserContent],
+                ];
+
                 $apiResponse = Http::withToken(config('services.ai.api_key'))
+                    ->timeout(15)
                     ->post('https://api.openai.com/v1/responses', [
                         'model' => $model,
-                        'input' => [
-                            ['role' => 'system', 'content' => $system],
-                            ['role' => 'user', 'content' => $prompt],
-                        ],
-                        'response_format' => [
-                            'type' => 'json_object',
-                        ],
+                        'input' => $inputMessages,
+                        'response_format' => ['type' => 'json_object'],
                     ]);
 
                 $jsonText = data_get($apiResponse->json(), 'output.0.content.0.text');
@@ -226,9 +222,9 @@ class AIOrderService
                 }
             }
 
-            $result['action'] = $this->normalizeAction((string) Arr::get($result, 'action', 'add_to_cart'));
+            $result['action'] = $this->normalizeAction((string) Arr::get($result, 'action', 'help'));
 
-            $this->log($message, $provider, $model, $prompt, $result, null, (int) ((microtime(true) - $start) * 1000));
+            $this->log($message, $provider, $model, $promptLog, $result, null, (int) ((microtime(true) - $start) * 1000));
 
             return $result;
         } catch (\Throwable $throwable) {
@@ -238,7 +234,7 @@ class AIOrderService
                 $message,
                 $provider,
                 $model,
-                $prompt,
+                $promptLog,
                 $fallback,
                 $throwable->getMessage(),
                 (int) ((microtime(true) - $start) * 1000)
@@ -246,6 +242,110 @@ class AIOrderService
 
             return $fallback;
         }
+    }
+
+    private function buildSystemPrompt(
+        string $retailerName,
+        string $catalogSnippet,
+        string $cartLines,
+        ?array $customerContext,
+        string $preferredLanguage,
+        string $customerName
+    ): string {
+        $nameHint = $customerName !== '' ? "The customer's name is {$customerName}." : '';
+
+        $system = <<<PROMPT
+You are a WhatsApp shopping assistant for {$retailerName}. Help customers browse products, add to cart, and place orders through natural conversation.
+{$nameHint}
+
+## Language
+Preferred: {$preferredLanguage}. Mirror the customer's language in every reply (English / Urdu / Roman Urdu). Never switch language unless the customer switches first.
+
+## Current Cart
+{$cartLines}
+
+## Product Catalog
+{$catalogSnippet}
+
+## YOUR RESPONSE FORMAT
+Always reply with a single JSON object with exactly these three keys:
+- "action": one of the allowed actions below (string)
+- "items": array of {"product": "name", "qty": number} — only populated for add_to_cart
+- "reply_text": your WhatsApp reply — PLAIN TEXT ONLY, 1–4 short lines, NO asterisks, NO markdown, NO bullet symbols
+
+## ACTIONS
+
+**add_to_cart**
+When: customer specifies a product and quantity to order.
+Examples: "2 milk", "ek bread chahiye", "olpers milk x3", "send 1 eggs and 2 juice"
+Rules: items must list each product + qty using the EXACT product name from the catalog. reply_text confirms what was added and current cart total.
+
+**show_catalog**
+When: customer wants to browse OR expresses purchase intent WITHOUT naming a specific product.
+Examples: "what do you have", "show products", "i want to order", "place order", "new order", "menu", "kya milta hai", "kuch order karna hai"
+Rules: items = []. reply_text invites them to pick.
+
+**track_order**
+When: customer asks about delivery or order status.
+Examples: "track order", "order status", "where is my order", "delivery kab hoga", "mera order kahan hai"
+Rules: items = []. reply_text is a brief acknowledgement.
+
+**help**
+When: greetings, introductions, confusion, support, or anything that is not an order.
+Examples: "hi", "hello", "who are you", "what can you do", "help", "Assalam o Alaikum"
+Rules: items = []. reply_text gives warm greeting + one-line instruction.
+
+**none**
+When: customer sends a filler acknowledgement with no actionable content.
+Examples: "ok", "okay", "thanks", "noted", "got it", "sure", "received", "thik hai", "acha"
+Rules: items = []. reply_text is a short friendly reply + gentle nudge toward next step.
+
+## STRICT RULES
+1. NEVER invent products — only use items that exist in the Product Catalog above.
+2. NEVER ask for or mention payment details, card numbers, or bank accounts. Payment is Cash on Delivery.
+3. If the message could mean either an order OR something else, prefer show_catalog over add_to_cart.
+4. If customer says "confirm", "yes confirm", "order kar do" — use show_catalog (the system handles order placement separately).
+5. reply_text MUST be plain text — absolutely no *, #, -, or any markdown.
+6. Keep reply_text SHORT — this is WhatsApp, not email. Max 4 lines.
+7. Never say "I am processing your request", "How may I assist you", or any robotic phrase.
+8. Be natural, warm, and concise — like a helpful store assistant on WhatsApp.
+PROMPT;
+
+        if (! empty($customerContext['summary'])) {
+            $system .= "\n\n## Customer History\n".(string) $customerContext['summary'];
+        }
+
+        return $system;
+    }
+
+    private function conversationHistoryMessages(Message $message, int $limit = 10): array
+    {
+        $query = Message::query()
+            ->whereNotNull('body')
+            ->where('retailer_id', $message->retailer_id)
+            ->where('id', '<', $message->id);
+
+        if ($message->customer_id) {
+            $query->where('customer_id', $message->customer_id);
+        } else {
+            $query->where('phone', $message->phone);
+        }
+
+        $rows = $query
+            ->latest('id')
+            ->limit($limit)
+            ->get(['direction', 'body'])
+            ->reverse()
+            ->values();
+
+        return $rows
+            ->map(fn (Message $row): array => [
+                'role' => $row->direction === 'in' ? 'user' : 'assistant',
+                'content' => trim((string) $row->body),
+            ])
+            ->filter(fn (array $m): bool => $m['content'] !== '')
+            ->values()
+            ->all();
     }
 
     private function heuristicItems(string $text): array
@@ -285,9 +385,10 @@ class AIOrderService
 
         return match ($normalized) {
             'add_to_cart', 'request_option', 'track_order', 'show_catalog', 'help', 'none' => $normalized,
-            'catalog', 'product_list', 'new_order', 'menu' => 'show_catalog',
-            'track', 'tracking', 'order_status' => 'track_order',
-            default => 'add_to_cart',
+            'catalog', 'product_list', 'new_order', 'menu', 'browse' => 'show_catalog',
+            'track', 'tracking', 'order_status', 'order_track' => 'track_order',
+            'greet', 'greeting', 'welcome', 'support', 'unknown', 'other' => 'help',
+            default => 'help', // safer fallback — never silently add unknown text to cart
         };
     }
 
@@ -326,10 +427,35 @@ class AIOrderService
                 : 'Great choice! Here is our available catalog. 🛍️'];
         }
 
-        if (in_array($normalized, ['hi', 'hello', 'hey', 'help', 'start'], true)) {
+        if (in_array($normalized, ['hi', 'hello', 'hey', 'help', 'start', 'hii', 'helo'], true)) {
             return ['action' => 'help', 'items' => [], 'reply_text' => $isUrdu
                 ? 'Assalam o Alaikum! 👋 Bilkul, main help karta/karti hoon.'
                 : 'Hi! 👋 Sure, I can help you with your order.'];
+        }
+
+        // Acknowledgement words — not an order, just a filler reply
+        if (in_array($normalized, ['ok', 'okay', 'k', 'yes', 'yeah', 'yep', 'sure', 'got it', 'thanks', 'thank you', 'thx', 'ty', 'noted', 'fine', 'great', 'good'], true)) {
+            return ['action' => 'none', 'items' => [], 'reply_text' => $isUrdu
+                ? 'Ji! Kuch aur chahiye? Agar order karna ho to quantity + naam likhein jaise "2 milk". 😊'
+                : 'Got it! 😊 Anything else? To order, just type quantity + item like "2 milk".'];
+        }
+
+        // Purchase intent — show catalog so customer can pick
+        if (
+            str_contains($normalized, 'want to order')
+            || str_contains($normalized, 'want to place')
+            || str_contains($normalized, 'place order')
+            || str_contains($normalized, 'place an order')
+            || str_contains($normalized, 'i want to order')
+            || str_contains($normalized, 'i want order')
+            || str_contains($normalized, 'order karna')
+            || str_contains($normalized, 'order chahiye')
+            || str_contains($normalized, 'order please')
+            || str_contains($normalized, 'mujhe order')
+        ) {
+            return ['action' => 'show_catalog', 'items' => [], 'reply_text' => $isUrdu
+                ? 'Bohat acha! Yeh raha hamara catalog. Kya lena chahte hain? 🛍️'
+                : 'Sure! Here is what we have. What would you like to order? 🛍️'];
         }
 
         if (
@@ -443,73 +569,6 @@ class AIOrderService
     private function optionCacheKey(?int $retailerId, string $phone): string
     {
         return 'wa:options:'.$retailerId.':'.$phone;
-    }
-
-    private function inferConversationStep(string $text): string
-    {
-        $normalized = mb_strtolower(trim($text));
-
-        if (
-            str_contains($normalized, 'track')
-            || str_contains($normalized, 'status')
-            || str_contains($normalized, 'where is my order')
-        ) {
-            return 'TRACKING';
-        }
-
-        if (
-            str_contains($normalized, 'confirm')
-            || str_contains($normalized, 'place order')
-            || str_contains($normalized, 'checkout')
-        ) {
-            return 'CONFIRM';
-        }
-
-        if (
-            str_contains($normalized, 'new order')
-            || str_contains($normalized, 'catalog')
-            || str_contains($normalized, 'menu')
-            || str_contains($normalized, 'product list')
-        ) {
-            return 'BROWSE';
-        }
-
-        if ($normalized === '' || in_array($normalized, ['hi', 'hello', 'hey', 'start', 'help'], true)) {
-            return 'WELCOME';
-        }
-
-        return 'CART';
-    }
-
-    private function conversationHistory(Message $message, int $limit = 6): string
-    {
-        $query = Message::query()
-            ->whereNotNull('body')
-            ->where('retailer_id', $message->retailer_id);
-
-        if ($message->customer_id) {
-            $query->where('customer_id', $message->customer_id);
-        } else {
-            $query->where('phone', $message->phone);
-        }
-
-        $rows = $query
-            ->latest('id')
-            ->limit($limit)
-            ->get(['direction', 'body'])
-            ->reverse()
-            ->values();
-
-        if ($rows->isEmpty()) {
-            return 'none';
-        }
-
-        return $rows
-            ->map(function (Message $row): string {
-                $speaker = $row->direction === 'in' ? 'customer' : 'assistant';
-                return $speaker.': '.trim((string) $row->body);
-            })
-            ->implode("\n");
     }
 
     private function catalogSnippet(?int $retailerId, int $limit = 8): string

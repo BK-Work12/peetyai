@@ -645,7 +645,9 @@ class ProcessIncomingMessage implements ShouldQueue
 
     private function checkoutProfileCacheKey(Message $message): string
     {
-        return 'wa:checkout-profile:'.$message->retailer_id.':'.$message->phone;
+        // Use phone only (not retailer_id) so the key stays consistent even
+        // if retailer_id was null when the flow started (old messages).
+        return 'wa:checkout-profile:'.$message->phone;
     }
 
     private function extractProductImageUrl(Product $product): ?string
