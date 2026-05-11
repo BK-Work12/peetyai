@@ -4,6 +4,7 @@ import { login } from '@/lib/api';
 import { useAuthStore } from '@/store/auth-store';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
+import type { AxiosError } from 'axios';
 
 const DEMO_ACCOUNTS = [
   { label: 'Super Admin', role: 'owner', email: 'owner@peetyai.com', password: 'password', icon: '👑', color: '#f59e0b' },
@@ -41,8 +42,18 @@ export default function LoginPage() {
         retailer_id: res.user.retailer_id,
       });
       router.push('/dashboard');
-    } catch {
-      setError('Invalid email or password.');
+    } catch (err) {
+      const axiosErr = err as AxiosError<{ message?: string }>;
+      const status = axiosErr.response?.status;
+      const apiMessage = axiosErr.response?.data?.message;
+
+      if (status && status >= 500) {
+        setError('Server is unavailable (API error). Please try again in a moment.');
+      } else if (apiMessage) {
+        setError(apiMessage);
+      } else {
+        setError('Invalid email or password.');
+      }
     } finally {
       setLoading(false);
     }

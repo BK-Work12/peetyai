@@ -141,6 +141,8 @@ issue_ssl_certificate() {
     --keep-until-expiring \
     --non-interactive \
     -d "$SSL_DOMAIN"
+
+  log "Certificate request completed."
 }
 
 parse_args() {
@@ -191,11 +193,20 @@ wait_for_service_running() {
   return 1
 }
 
+repair_backend_dependencies() {
+  log "Attempting backend dependency repair (composer install)..."
+  docker compose run --rm backend composer install --no-interaction --prefer-dist --optimize-autoloader
+  docker compose up -d backend backend-worker
+}
+
 start_stack() {
   log "Building and starting containers..."
   docker compose up -d --build
 
-  wait_for_service_running backend 45
+  if ! wait_for_service_running backend 45; then
+    repair_backend_dependencies
+    wait_for_service_running backend 45
+  fi
 
   log "Running Laravel setup..."
   if grep -Eq '^APP_KEY=$' backend/.env || ! grep -Eq '^APP_KEY=base64:' backend/.env; then

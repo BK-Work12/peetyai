@@ -14,6 +14,7 @@ services:
 
   certbot:
     image: certbot/certbot:latest
+    profiles: ["tools"]
     volumes:
       - certbot_webroot:/var/www/certbot
       - letsencrypt:/etc/letsencrypt
