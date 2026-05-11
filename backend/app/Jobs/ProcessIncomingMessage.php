@@ -50,6 +50,12 @@ class ProcessIncomingMessage implements ShouldQueue
             return;
         }
 
+        if ($this->handleInteractiveShortcut($message, $cartService, $orderService, $whatsAppClient)) {
+            $message->forceFill(['processed' => true])->save();
+
+            return;
+        }
+
         if ($this->handlePendingCheckoutProfile($message, $cartService, $orderService, $whatsAppClient)) {
             $message->forceFill(['processed' => true])->save();
 
@@ -84,29 +90,7 @@ class ProcessIncomingMessage implements ShouldQueue
         }
 
         if (mb_strtolower(trim((string) $message->body)) === 'confirm') {
-            $cart = $cartService->getOrCreate($message->retailer_id, $message->phone, $message->customer);
-            $cart->load('items.product');
-
-            if ($cart->items->isEmpty()) {
-                $this->safeSendText($whatsAppClient, $message, 'Your cart is empty. Send products first.');
-            } else {
-                $missingFields = $this->missingCheckoutFields($message->customer);
-                if ($missingFields !== []) {
-                    $this->startCheckoutProfileFlow($message, $missingFields, $whatsAppClient);
-                    $message->forceFill(['processed' => true])->save();
-
-                    return;
-                }
-
-                $order = $orderService->placeFromCart(
-                    $cart,
-                    $message->customer,
-                    $this->buildOrderNote($message->customer),
-                    true
-                );
-                $trackingHint = 'Reply TRACK ORDER anytime to check live status.';
-                $this->safeSendText($whatsAppClient, $message, "Order #{$order->id} placed successfully. {$trackingHint}");
-            }
+            $this->handleConfirmIntent($message, $cartService, $orderService, $whatsAppClient);
 
             $message->forceFill(['processed' => true])->save();
 
@@ -125,15 +109,23 @@ class ProcessIncomingMessage implements ShouldQueue
         }
 
         if (($result['action'] ?? null) === 'show_catalog') {
-            $catalogText = $this->buildCatalogMessage($message->retailer_id);
-            $this->safeSendText($whatsAppClient, $message, $this->mergeReply($aiReply, $catalogText));
+            $this->sendCatalogWithButtons($message, $whatsAppClient, $aiReply);
             $message->forceFill(['processed' => true])->save();
 
             return;
         }
 
         if (($result['action'] ?? null) === 'help' || ($result['action'] ?? null) === 'none') {
-            $this->safeSendText($whatsAppClient, $message, $aiReply ?: $this->buildHelpMessage($message));
+            $this->safeSendButtons(
+                $whatsAppClient,
+                $message,
+                $aiReply ?: $this->buildHelpMessage($message),
+                [
+                    ['id' => 'BTN_CATALOG', 'title' => 'Show Items'],
+                    ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                    ['id' => 'BTN_CONFIRM', 'title' => 'Confirm Order'],
+                ]
+            );
             $message->forceFill(['processed' => true])->save();
 
             return;
@@ -161,14 +153,18 @@ class ProcessIncomingMessage implements ShouldQueue
             $addedQty = max(0, (int) $afterTotals['items_count'] - (int) $beforeTotals['items_count']);
 
             if ($addedQty === 0) {
-                $fallback = $this->buildNoMatchMessage($message->retailer_id);
-                $this->safeSendText($whatsAppClient, $message, $this->mergeReply($aiReply, $fallback));
+                $this->sendCatalogWithButtons($message, $whatsAppClient, $this->mergeReply($aiReply, 'I could not match that exactly.'));
             } else {
-                $fallback = "Added to cart. Items: {$afterTotals['items_count']}, subtotal: {$afterTotals['subtotal']}. Reply CONFIRM to place order.";
-                $this->safeSendText(
+                $fallback = "Added to cart. Items: {$afterTotals['items_count']}, subtotal: {$afterTotals['subtotal']}.";
+                $this->safeSendButtons(
                     $whatsAppClient,
                     $message,
-                    $aiReply ?: $fallback
+                    $aiReply ?: $fallback,
+                    [
+                        ['id' => 'BTN_CONFIRM', 'title' => 'Confirm Order'],
+                        ['id' => 'BTN_CATALOG', 'title' => 'Add More'],
+                        ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                    ]
                 );
             }
         } else {
@@ -247,6 +243,159 @@ class ProcessIncomingMessage implements ShouldQueue
         return "I could not match those items to your store catalog.\n".$catalog;
     }
 
+    private function handleInteractiveShortcut(
+        Message $message,
+        CartService $cartService,
+        OrderService $orderService,
+        WhatsAppClient $whatsAppClient
+    ): bool {
+        $command = trim((string) $message->body);
+
+        if ($command === '') {
+            return false;
+        }
+
+        $normalized = mb_strtoupper($command);
+        if ($normalized === 'BTN_CATALOG') {
+            $this->sendCatalogWithButtons($message, $whatsAppClient);
+
+            return true;
+        }
+
+        if ($normalized === 'BTN_TRACK') {
+            $this->safeSendText($whatsAppClient, $message, $this->buildOrderTrackingMessage($message));
+
+            return true;
+        }
+
+        if ($normalized === 'BTN_CONFIRM') {
+            $this->handleConfirmIntent($message, $cartService, $orderService, $whatsAppClient);
+
+            return true;
+        }
+
+        if (preg_match('/^ADD_(\d+)_(\d+)$/', $command, $matches)) {
+            $productId = (int) $matches[1];
+            $qty = max(1, (int) $matches[2]);
+
+            $product = Product::query()
+                ->where('retailer_id', $message->retailer_id)
+                ->where('is_active', true)
+                ->find($productId);
+
+            if (! $product) {
+                $this->sendCatalogWithButtons($message, $whatsAppClient, 'That item is no longer available.');
+
+                return true;
+            }
+
+            $cart = $cartService->getOrCreate($message->retailer_id, $message->phone, $message->customer);
+            $cart = $cartService->applyItems($cart, [[
+                'product_id' => $product->id,
+                'qty' => $qty,
+            ]]);
+            $totals = $cartService->totals($cart);
+
+            $label = trim(($product->brand ? $product->brand.' ' : '').$product->name);
+            $this->safeSendButtons(
+                $whatsAppClient,
+                $message,
+                "Done. Added {$qty} x {$label}. Cart items: {$totals['items_count']}, subtotal: {$totals['subtotal']}.",
+                [
+                    ['id' => 'BTN_CONFIRM', 'title' => 'Confirm Order'],
+                    ['id' => 'BTN_CATALOG', 'title' => 'Add More'],
+                    ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                ]
+            );
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private function handleConfirmIntent(
+        Message $message,
+        CartService $cartService,
+        OrderService $orderService,
+        WhatsAppClient $whatsAppClient
+    ): void {
+        $cart = $cartService->getOrCreate($message->retailer_id, $message->phone, $message->customer);
+        $cart->load('items.product');
+
+        if ($cart->items->isEmpty()) {
+            $this->safeSendButtons(
+                $whatsAppClient,
+                $message,
+                'Your cart is empty. Pick an item first.',
+                [
+                    ['id' => 'BTN_CATALOG', 'title' => 'Show Items'],
+                    ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                ]
+            );
+
+            return;
+        }
+
+        $missingFields = $this->missingCheckoutFields($message->customer);
+        if ($missingFields !== []) {
+            $this->startCheckoutProfileFlow($message, $missingFields, $whatsAppClient);
+
+            return;
+        }
+
+        $order = $orderService->placeFromCart(
+            $cart,
+            $message->customer,
+            $this->buildOrderNote($message->customer),
+            true
+        );
+
+        $this->safeSendButtons(
+            $whatsAppClient,
+            $message,
+            "Thanks. Order #{$order->id} placed successfully.",
+            [
+                ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+                ['id' => 'BTN_CATALOG', 'title' => 'New Order'],
+            ]
+        );
+    }
+
+    private function sendCatalogWithButtons(
+        Message $message,
+        WhatsAppClient $whatsAppClient,
+        ?string $intro = null,
+    ): void {
+        $products = Product::query()
+            ->where('retailer_id', $message->retailer_id)
+            ->where('is_active', true)
+            ->orderByDesc('priority')
+            ->orderBy('name')
+            ->limit(3)
+            ->get(['id', 'name', 'brand', 'price']);
+
+        $catalogText = $this->buildCatalogMessage($message->retailer_id);
+        $text = $this->mergeReply($intro, $catalogText);
+
+        $buttons = $products->map(function (Product $product) {
+            $label = trim(($product->brand ? $product->brand.' ' : '').$product->name);
+
+            return [
+                'id' => 'ADD_'.$product->id.'_1',
+                'title' => mb_substr('Add '.$label, 0, 20),
+            ];
+        })->values()->all();
+
+        if ($buttons === []) {
+            $buttons = [
+                ['id' => 'BTN_TRACK', 'title' => 'Track Order'],
+            ];
+        }
+
+        $this->safeSendButtons($whatsAppClient, $message, $text, $buttons);
+    }
+
     private function safeSendText(WhatsAppClient $whatsAppClient, Message $message, string $text): void
     {
         try {
@@ -263,6 +412,34 @@ class ProcessIncomingMessage implements ShouldQueue
                 'phone' => $message->phone,
                 'error' => $throwable->getMessage(),
             ]);
+        }
+    }
+
+    private function safeSendButtons(
+        WhatsAppClient $whatsAppClient,
+        Message $message,
+        string $text,
+        array $buttons
+    ): void {
+        try {
+            $whatsAppClient->sendButtons(
+                $message->phone,
+                $text,
+                $buttons,
+                $message->retailer_id,
+                $message->customer_id,
+            );
+        } catch (
+            \Throwable $throwable
+        ) {
+            Log::warning('WhatsApp button send failed', [
+                'message_id' => $message->id,
+                'retailer_id' => $message->retailer_id,
+                'phone' => $message->phone,
+                'error' => $throwable->getMessage(),
+            ]);
+
+            $this->safeSendText($whatsAppClient, $message, $text);
         }
     }
 
@@ -294,7 +471,7 @@ class ProcessIncomingMessage implements ShouldQueue
 
     private function buildHelpMessage(Message $message): string
     {
-        return "Hi! 👋\nYou can send:\n- NEW ORDER (to see products)\n- 2 milk, 1 bread (to add items)\n- CONFIRM (to place order)\n- TRACK ORDER (to check status)";
+        return "Hi! I am here to help with your order.\nTap a button or type quantity + item like: 2 milk.";
     }
 
     private function missingCheckoutFields(?Customer $customer): array

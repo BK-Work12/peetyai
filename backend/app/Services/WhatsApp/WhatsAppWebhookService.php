@@ -30,6 +30,8 @@ class WhatsAppWebhookService
                     $contact = $contactsByWaId->get($phone, []);
 
                     $body = Arr::get($incoming, 'text.body')
+                        ?? Arr::get($incoming, 'interactive.button_reply.id')
+                        ?? Arr::get($incoming, 'interactive.button_reply.title')
                         ?? Arr::get($incoming, 'voice.caption')
                         ?? Arr::get($incoming, 'image.caption');
 

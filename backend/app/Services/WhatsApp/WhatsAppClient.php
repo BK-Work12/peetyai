@@ -129,6 +129,88 @@ class WhatsAppClient
         ?int $customerId = null
     ): void
     {
+        $this->sendMessage(
+            $phone,
+            [
+                'type' => 'text',
+                'text' => [
+                    'body' => $message,
+                ],
+            ],
+            $message,
+            'text',
+            $retailerId,
+            $customerId,
+        );
+    }
+
+    public function sendButtons(
+        string $phone,
+        string $message,
+        array $buttons,
+        ?int $retailerId = null,
+        ?int $customerId = null
+    ): void
+    {
+        $preparedButtons = collect($buttons)
+            ->map(function (array $button) {
+                $id = trim((string) ($button['id'] ?? ''));
+                $title = trim((string) ($button['title'] ?? ''));
+                if ($id === '' || $title === '') {
+                    return null;
+                }
+
+                return [
+                    'type' => 'reply',
+                    'reply' => [
+                        'id' => mb_substr($id, 0, 256),
+                        'title' => mb_substr($title, 0, 20),
+                    ],
+                ];
+            })
+            ->filter()
+            ->take(3)
+            ->values()
+            ->all();
+
+        if ($preparedButtons === []) {
+            $this->sendText($phone, $message, $retailerId, $customerId);
+
+            return;
+        }
+
+        $this->sendMessage(
+            $phone,
+            [
+                'type' => 'interactive',
+                'interactive' => [
+                    'type' => 'button',
+                    'body' => [
+                        'text' => $message,
+                    ],
+                    'action' => [
+                        'buttons' => $preparedButtons,
+                    ],
+                ],
+            ],
+            $message,
+            'interactive',
+            $retailerId,
+            $customerId,
+            ['request_buttons' => $preparedButtons],
+        );
+    }
+
+    private function sendMessage(
+        string $phone,
+        array $request,
+        string $messageBody,
+        string $messageType,
+        ?int $retailerId = null,
+        ?int $customerId = null,
+        array $extraRawPayload = [],
+    ): void
+    {
         if ($retailerId === null && $customerId !== null) {
             $retailerId = Customer::query()->whereKey($customerId)->value('retailer_id');
         }
@@ -159,14 +241,11 @@ class WhatsAppClient
             foreach ($credentialCandidates as $candidate) {
                 try {
                     $response = Http::withToken((string) $candidate['token'])
-                        ->post("https://graph.facebook.com/v20.0/{$candidate['phone_number_id']}/messages", [
+                        ->post("https://graph.facebook.com/v20.0/{$candidate['phone_number_id']}/messages", array_merge([
                             'messaging_product' => 'whatsapp',
                             'to' => $phone,
-                            'type' => 'text',
-                            'text' => [
-                                'body' => $message,
-                            ],
-                        ])->throw();
+                        ], $request))
+                        ->throw();
 
                     $responsePayload = $response->json();
                     $externalId = data_get($responsePayload, 'messages.0.id');
@@ -188,7 +267,7 @@ class WhatsAppClient
             }
         }
 
-        $rawPayload = ['request_text' => $message];
+        $rawPayload = array_merge(['request_text' => $messageBody], $extraRawPayload);
         $rawPayload['credential_source'] = $finalCredentialSource;
         $rawPayload['credential_attempts'] = $attempts;
         if (is_array($responsePayload)) {
@@ -207,10 +286,10 @@ class WhatsAppClient
             'customer_id' => $customerId,
             'direction' => 'out',
             'channel' => 'whatsapp',
-            'message_type' => 'text',
+            'message_type' => $messageType,
             'external_id' => $externalId,
             'phone' => $phone,
-            'body' => $message,
+            'body' => $messageBody,
             'raw_payload' => $rawPayload,
             'processed' => true,
         ]);
