@@ -33,6 +33,14 @@ class AIOrderService
             return $this->sameAsLastTime($message, $customer);
         }
 
+        // Pre-flight: intercept obvious intents BEFORE calling the LLM so the
+        // AI can never mis-classify clear-cut inputs (greetings, ack words,
+        // purchase-intent without a product name, track requests).
+        $preflight = $this->preflightIntent($text, $message);
+        if ($preflight !== null) {
+            return $preflight;
+        }
+
         $response = $this->callLlm($message, $text, $customerContext);
         $action = $this->normalizeAction((string) Arr::get($response, 'action', 'add_to_cart'));
         $replyText = $this->extractReplyText($response);
@@ -390,6 +398,104 @@ PROMPT;
             'greet', 'greeting', 'welcome', 'support', 'unknown', 'other' => 'help',
             default => 'help', // safer fallback — never silently add unknown text to cart
         };
+    }
+
+    /**
+     * Pre-flight intent detection — runs BEFORE the LLM call.
+     * Returns a result array for obvious cases so the AI never mis-classifies them.
+     * Returns null when the message needs LLM processing (e.g. actual product orders).
+     */
+    private function preflightIntent(string $text, Message $message): ?array
+    {
+        $n = mb_strtolower(trim($text));
+        $isUrdu = $this->detectLanguagePreference($text, $message) === 'urdu';
+
+        if ($n === '') {
+            return ['action' => 'help', 'items' => [], 'reply_text' => $isUrdu
+                ? 'Ji! Kuch order karna hai? 😊'
+                : 'Hi! What would you like to order today? 😊'];
+        }
+
+        // --- Greetings ---
+        $greetings = ['hi', 'hii', 'hello', 'hey', 'helo', 'helloo', 'salam', 'assalam', 'aoa', 'help', 'start', 'menu'];
+        if (in_array($n, $greetings, true) || preg_match('/^(hi|hello|hey|salam)\W*$/u', $n)) {
+            return ['action' => 'help', 'items' => [], 'reply_text' => $isUrdu
+                ? 'Assalam o Alaikum! 👋 Kya order karna hai? Catalog dekhne ke liye "catalog" likhein.'
+                : 'Hi! 👋 Welcome! Type *catalog* to see our products or just tell me what you need.'];
+        }
+
+        // --- Acknowledgements / filler words (must not add to cart) ---
+        $acks = ['ok', 'okay', 'k', 'okk', 'ok', 'yes', 'yeah', 'yep', 'yup', 'sure',
+                 'got it', 'noted', 'thanks', 'thank you', 'thx', 'ty', 'thnx',
+                 'fine', 'great', 'good', 'nice', 'cool', 'done', 'received',
+                 'acha', 'achha', 'theek', 'thik hai', 'theek hai', 'ji', 'haan', 'han'];
+        if (in_array($n, $acks, true)) {
+            return ['action' => 'none', 'items' => [], 'reply_text' => $isUrdu
+                ? 'Ji bilkul! 😊 Kuch aur chahiye? Order karne ke liye quantity + naam likhein jaise "2 milk".'
+                : 'Got it! 😊 Anything else? Just type quantity + item to order, e.g. "2 milk".'];
+        }
+
+        // --- Purchase intent WITHOUT a product name → show catalog ---
+        $purchasePatterns = [
+            'want to order', 'want to place', 'place order', 'place an order',
+            'i want to order', 'i want order', 'i need to order', 'mujhe order',
+            'order karna', 'order chahiye', 'order please', 'kuch order',
+            'i want to buy', 'want to buy', 'buy something', 'shopping karna',
+            'new order', 'start order', 'kya milta', 'kya hai',
+        ];
+        foreach ($purchasePatterns as $pattern) {
+            if (str_contains($n, $pattern)) {
+                return ['action' => 'show_catalog', 'items' => [], 'reply_text' => $isUrdu
+                    ? 'Bilkul! Yeh raha hamara catalog. Kya lena chahte hain? 🛍️'
+                    : 'Sure! Here is what we have. What would you like? 🛍️'];
+            }
+        }
+
+        // --- Track order ---
+        $trackPatterns = ['track order', 'track my order', 'order status', 'where is my order',
+                          'mera order', 'order kahan', 'delivery kab', 'order track'];
+        foreach ($trackPatterns as $pattern) {
+            if (str_contains($n, $pattern)) {
+                return ['action' => 'track_order', 'items' => [], 'reply_text' => $isUrdu
+                    ? 'Bilkul! Aap ka latest order status check karta hoon. 📦'
+                    : 'Sure! Let me pull up your latest order. 📦'];
+            }
+        }
+
+        // --- Catalog / browse ---
+        $catalogPatterns = ['catalog', 'products', 'product list', 'show items', 'show products',
+                            'what do you have', 'what do you sell', 'kya bechte', 'list'];
+        foreach ($catalogPatterns as $pattern) {
+            if (str_contains($n, $pattern)) {
+                return ['action' => 'show_catalog', 'items' => [], 'reply_text' => $isUrdu
+                    ? 'Yeh raha hamara catalog! 🛍️'
+                    : 'Here is our catalog! 🛍️'];
+            }
+        }
+
+        // If text has NO digits and is very short (1-2 words) with no product-like content → help
+        // This catches things like "order", "buy", "shopping" alone
+        $wordCount = str_word_count($n);
+        if ($wordCount <= 2 && ! preg_match('/\d/', $n)) {
+            $productLikeWords = ['milk', 'bread', 'eggs', 'juice', 'rice', 'oil', 'flour', 'sugar', 'water', 'butter'];
+            $looksLikeProduct = false;
+            foreach ($productLikeWords as $word) {
+                if (str_contains($n, $word)) {
+                    $looksLikeProduct = true;
+                    break;
+                }
+            }
+            // Very short generic words that are not product names → let LLM handle or show help
+            $genericSingleWords = ['order', 'buy', 'shop', 'shopping', 'purchase', 'delivery', 'deliver'];
+            if (! $looksLikeProduct && in_array($n, $genericSingleWords, true)) {
+                return ['action' => 'show_catalog', 'items' => [], 'reply_text' => $isUrdu
+                    ? 'Bilkul! Yeh raha hamara catalog. 🛍️'
+                    : 'Sure! Here is what we have. 🛍️'];
+            }
+        }
+
+        // All other text → needs LLM (likely a real product request like "2 milk" or "send eggs")
+        return null;
     }
 
     private function fallbackIntent(string $text): array
