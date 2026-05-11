@@ -13,19 +13,21 @@ class WhatsAppWebhookService
     public function processInboundPayload(array $payload): void
     {
         $entries = Arr::get($payload, 'entry', []);
+        $envPhoneNumberId = trim((string) config('services.whatsapp.phone_number_id'));
 
         foreach ($entries as $entry) {
             foreach (Arr::get($entry, 'changes', []) as $change) {
                 $value = Arr::get($change, 'value', []);
                 $phoneNumberId = Arr::get($value, 'metadata.phone_number_id');
 
-                $retailer = Retailer::query()
-                    ->where('settings->whatsapp->phone_number_id', $phoneNumberId)
-                    ->first();
+                $retailer = $this->resolveRetailer($phoneNumberId, $envPhoneNumberId);
+                $contactsByWaId = collect(Arr::get($value, 'contacts', []))
+                    ->keyBy(fn ($contact) => (string) Arr::get($contact, 'wa_id'));
 
                 foreach (Arr::get($value, 'messages', []) as $incoming) {
                     $phone = (string) Arr::get($incoming, 'from');
                     $type = (string) Arr::get($incoming, 'type', 'text');
+                    $contact = $contactsByWaId->get($phone, []);
 
                     $body = Arr::get($incoming, 'text.body')
                         ?? Arr::get($incoming, 'voice.caption')
@@ -41,7 +43,7 @@ class WhatsAppWebhookService
                                 'phone' => $phone,
                             ],
                             [
-                                'name' => Arr::get($incoming, 'profile.name'),
+                                'name' => Arr::get($contact, 'profile.name'),
                             ],
                         );
                     }
@@ -63,5 +65,29 @@ class WhatsAppWebhookService
                 }
             }
         }
+    }
+
+    private function resolveRetailer(?string $phoneNumberId, string $envPhoneNumberId): ?Retailer
+    {
+        $phoneNumberId = trim((string) $phoneNumberId);
+
+        if ($phoneNumberId !== '') {
+            $retailer = Retailer::query()
+                ->where('settings->whatsapp->phone_number_id', $phoneNumberId)
+                ->first();
+
+            if ($retailer) {
+                return $retailer;
+            }
+        }
+
+        if ($phoneNumberId !== '' && $envPhoneNumberId !== '' && $phoneNumberId === $envPhoneNumberId) {
+            // Env credentials are shared app-wide; if a single retailer exists, route inbound messages there.
+            if (Retailer::query()->count() === 1) {
+                return Retailer::query()->first();
+            }
+        }
+
+        return null;
     }
 }
