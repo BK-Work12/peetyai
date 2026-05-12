@@ -406,6 +406,16 @@ SYSTEM;
             }
         }
 
+        // Small talk
+        foreach (['how are you', 'how r u', 'how are u', 'are you there', 'you there', 'whats up', 'what\'s up', 'are u there', 'كيف حالك', 'هل انت هنا', 'وينك'] as $s) {
+            if ($n === $s || str_contains($n, $s)) {
+                return ['action' => 'none', 'items' => [], 'reply_text' =>
+                    $isAr
+                        ? 'تمام الحمدلله! انا موجود معك. قل لي ماذا تريد اطلب لك؟'
+                        : 'I am doing great and I am here with you. Tell me what you would like to order.'];
+            }
+        }
+
         // Acknowledgements
         foreach (['ok', 'okay', 'k', 'yes', 'yeah', 'sure', 'got it', 'noted', 'thanks',
                   'thank you', 'thx', 'fine', 'good', 'شكرا', 'تمام', 'حسنا', 'موافق', 'نعم', 'اوكي'] as $a) {
@@ -444,8 +454,8 @@ SYSTEM;
 
         return ['action' => 'help', 'items' => [], 'reply_text' =>
             $isAr
-                ? 'كيف اقدر اساعدك؟ اكتب اسم المنتج والكمية لاضافته لسلتك.'
-                : 'What would you like? Type "catalog" to see available items.'];
+                ? 'اكيد! انا معك. تقدر تكتب اسم المنتج والكمية او اكتب قائمة.'
+                : 'Sure, I am here. You can type an item with quantity, or type catalog.'];
     }
 
     // ─────────────────────────────────────────────────────────────────────────

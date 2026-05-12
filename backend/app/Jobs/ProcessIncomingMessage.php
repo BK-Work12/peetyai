@@ -455,8 +455,6 @@ class ProcessIncomingMessage implements ShouldQueue
                 'phone' => $message->phone,
                 'error' => $throwable->getMessage(),
             ]);
-
-            $this->safeSendText($whatsAppClient, $message, $text);
         }
     }
 
